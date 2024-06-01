@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Creates RDS with multi-az and read replica, S3 bucket, AMI server, Web server and an auto scaling group.
+
+Resources:
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnet group containing private subnets 1 and 2
+      DBSubnetGroupName: Private Subnet Group - CF
+      SubnetIds:
+        - !ImportValue PrivateSubnet1Id
+        - !ImportValue PrivateSubnet2Id
+
+  PrimaryRDS:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: Primary-RDS-CF
+      AllocatedStorage: '20'
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: 8.0.35
+      MasterUsername: admin
+      MasterUserPassword: password
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !ImportValue RDSSGId
+      PubliclyAccessible: false
+      MultiAZ: true
+      StorageType: gp2
+      DBName: cloudformationdatabase
+
+  ReadReplica:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      SourceDBInstanceIdentifier: !Ref PrimaryRDS
+      DBInstanceIdentifier: Read-Replica-RDS-CF
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: 8.0.35
+      VPCSecurityGroups:
+        - !ImportValue RDSSGId
+      PubliclyAccessible: false
+      AvailabilityZone: us-east-1b
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: s3bucket346347-cf
+      
+  AMIServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      KeyName: projectkey-fp
+      ImageId: ami-00beae93a2d981137
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          SubnetId: !ImportValue PublicSubnet2Id
+          GroupSet:
+            - !ImportValue AMIServerSGId
+      Tags:
+        - Key: Name
+          Value: AMI-Server-CF
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum -y update
+          amazon-linux-extras install php7.4 -y
+          yum -y install php php-mbstring php-xml httpd mysql
+          wget http://wordpress.org/latest.tar.gz -P /tmp/
+          tar zxvf /tmp/latest.tar.gz -C /tmp
+          cp -r /tmp/wordpress/* /var/www/html/
+          chown apache:apache -R /var/www/html
+          systemctl enable httpd.service
+          systemctl start httpd.service
+        
+  WebServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      KeyName: projectkey-fp
+      ImageId: ami-08d770fb9e1d84a4f
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          SubnetId: !ImportValue PublicSubnet2Id
+          GroupSet:
+            - !ImportValue WebServerSGId
+      Tags:
+        - Key: Name
+          Value: Web-Server-CF
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum -y update
+          amazon-linux-extras install php7.4 -y
+          yum -y install php php-mbstring php-xml httpd mysql
+          wget http://wordpress.org/latest.tar.gz -P /tmp/
+          tar zxvf /tmp/latest.tar.gz -C /tmp
+          cp -r /tmp/wordpress/* /var/www/html/
+          chown apache:apache -R /var/www/html
+          systemctl enable httpd.service
+          systemctl start httpd.service
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: LaunchTemplate-CF
+      LaunchTemplateData:
+        InstanceType: t2.micro     
+        KeyName: projectkey-fp       
+        SecurityGroupIds:
+          - !ImportValue ALBSGId            
+        ImageId: ami-08d770fb9e1d84a4f
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum -y update
+            amazon-linux-extras install php7.4 -y
+            yum -y install php php-mbstring php-xml httpd mysql
+            wget http://wordpress.org/latest.tar.gz -P /tmp/
+            tar zxvf /tmp/latest.tar.gz -C /tmp
+            cp -r /tmp/wordpress/* /var/www/html/
+            chown apache:apache -R /var/www/html
+            systemctl enable httpd.service
+            systemctl start httpd.service
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !ImportValue PrivateSubnet1Id
+        - !ImportValue PrivateSubnet2Id
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      MaxSize: '3'
+      DesiredCapacity: '1'
+      TargetGroupARNs:
+        - !ImportValue ALBTargetGroupId
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - Key: Name
+          Value: AutoScalingGroup-CF
+          PropagateAtLaunch: true
+
+  ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: SimpleScaling
+      ScalingAdjustment: 1
+      AdjustmentType: ChangeInCapacity
+      Cooldown: '300'
+
+  ScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: SimpleScaling
+      ScalingAdjustment: -1
+      AdjustmentType: ChangeInCapacity
+      Cooldown: '300'
+
+  CPUHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Triggers if CPU utilization is greater than 70%"
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ScaleOutPolicy
+
+  CPULowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Triggers if CPU utilization is less than 25%"
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref AutoScalingGroup
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 25
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref ScaleInPolicy
+
+Outputs:
+  RDSInstanceEndpoint:
+    Description: Endpoint of the primary RDS instance
+    Value: !GetAtt PrimaryRDS.Endpoint.Address
+  ReadReplicaEndpoint:
+    Description: Endpoint of the read replica
+    Value: !GetAtt ReadReplica.Endpoint.Address
+  BucketName:
+    Description: Name of the S3 bucket
+    Value: !Ref S3Bucket
+  AMIPublicIP:
+    Description: The public IP address of the AMI server
+    Value: !GetAtt AMIServer.PublicIp
+  AMIPrivateIP:
+    Description: The private IP address of the AMI server
+    Value: !GetAtt AMIServer.PrivateIp
+  WebPublicIP:
+    Description: The public IP address of the Web server
+    Value: !GetAtt WebServer.PublicIp
+  WebPrivateIP:
+    Description: The private IP address of the Web server
+    Value: !GetAtt WebServer.PrivateIp
